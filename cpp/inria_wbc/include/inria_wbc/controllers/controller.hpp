@@ -21,12 +21,15 @@
 #include <tsid/tasks/task-joint-bounds.hpp>
 #include <tsid/tasks/task-joint-posVelAcc-bounds.hpp>
 #include <tsid/tasks/task-joint-posture.hpp>
+#include <tsid/tasks/task-momentum-equality.hpp>
 #include <tsid/tasks/task-se3-equality.hpp>
 #include <tsid/trajectories/trajectory-base.hpp>
 
+#include <inria_wbc/safety/collision_check.hpp>
 #include <inria_wbc/utils/factory.hpp>
 #include <inria_wbc/utils/utils.hpp>
 
+#include <boost/optional.hpp>
 #include <boost/variant.hpp>
 
 namespace inria_wbc {
@@ -48,7 +51,6 @@ namespace inria_wbc {
             Controller& operator=(const Controller& o) = delete;
             virtual ~Controller(){};
 
-
             // path where the files are stored (everything should be relative to this)
             const std::string& base_path() const { return base_path_; }
 
@@ -62,30 +64,30 @@ namespace inria_wbc {
             std::vector<std::string> all_dofs(bool filter_mimics = true) const;
             std::vector<std::string> activated_contacts() { return activated_contacts_; };
             std::unordered_map<std::string, tsid::math::Vector> activated_contacts_forces() { return activated_contacts_forces_; };
-            virtual const Eigen::Vector2d& cop() const
+            virtual const boost::optional<Eigen::Vector2d>& cop() const
             {
-                static Eigen::Vector2d tmp;
+                static boost::optional<Eigen::Vector2d> tmp = boost::none;
                 IWBC_ERROR("No COP estimator in controller.");
                 return tmp;
             }
 
-            virtual const Eigen::Vector2d& cop_raw() const
+            virtual const boost::optional<Eigen::Vector2d>& cop_raw() const
             {
-                static Eigen::Vector2d tmp;
+                static boost::optional<Eigen::Vector2d> tmp = boost::none;
                 IWBC_ERROR("No COP estimator in controller.");
                 return tmp;
             }
 
-            virtual const Eigen::Vector2d& lcop() const
+            virtual const boost::optional<Eigen::Vector2d>& lcop() const
             {
-                static Eigen::Vector2d tmp;
+                static boost::optional<Eigen::Vector2d> tmp = boost::none;
                 IWBC_ERROR("No COP estimator in controller.");
                 return tmp;
             }
 
-            virtual const Eigen::Vector2d& rcop() const
+            virtual const boost::optional<Eigen::Vector2d>& rcop() const
             {
-                static Eigen::Vector2d tmp;
+                static boost::optional<Eigen::Vector2d> tmp = boost::none;
                 IWBC_ERROR("No COP estimator in controller.");
                 return tmp;
             }
@@ -111,7 +113,7 @@ namespace inria_wbc {
 
             const std::vector<int>& non_mimic_indexes() const { return non_mimic_indexes_; }
             Eigen::VectorXd filter_cmd(const Eigen::VectorXd& cmd) const { return utils::slice_vec(cmd, non_mimic_indexes_); }
-            
+
             Eigen::VectorXd tau(bool filter_mimics = true) const;
             Eigen::VectorXd ddq(bool filter_mimics = true) const;
             Eigen::VectorXd dq(bool filter_mimics = true) const;
@@ -121,7 +123,6 @@ namespace inria_wbc {
 
             double t() const { return t_; };
             double dt() const { return dt_; };
-            const YAML::Node& config() const { return config_; };
 
             std::shared_ptr<tsid::robots::RobotWrapper> robot() { return robot_; };
             std::shared_ptr<tsid::InverseDynamicsFormulationAccForce> tsid() { return tsid_; };
@@ -134,14 +135,14 @@ namespace inria_wbc {
             {
                 assert(tsid_);
                 assert(robot_);
-                assert(robot_->model().existJointName(joint_name));
+                IWBC_ASSERT(robot_->model().existJointName(joint_name), "[", joint_name, "] (joint) does not exist!");
                 return robot_->position(tsid_->data(), robot_->model().getJointId(joint_name));
             }
             pinocchio::SE3 model_frame_pos(const std::string& frame_name) const
             {
                 assert(tsid_);
                 assert(robot_);
-                assert(robot_->model().existFrame(frame_name));
+                IWBC_ASSERT(robot_->model().existFrame(frame_name), "[", frame_name, "] (frame) does not exist!");
                 return robot_->framePosition(tsid_->data(), robot_->model().getFrameId(frame_name));
             }
             double cost(const std::shared_ptr<tsid::tasks::TaskBase>& task) const
@@ -154,14 +155,20 @@ namespace inria_wbc {
             void set_verbose(bool b) { verbose_ = b; }
             bool verbose() const { return verbose_; }
 
-            void save_configuration(const std::string config_name, const std::string robot_name = "robot") const;
-            void set_behavior_type(std::string bt);
-            std::string behavior_type() const { return behavior_type_; }
-            virtual void parse_stabilizer(const YAML::Node& config)
-            {
-                if (verbose_)
-                    std::cout << "There is no stabilizer for this controller" << std::endl;
-            };
+            void save_configuration(const std::string& config_name, const std::string& robot_name = "robot") const;
+            virtual void set_behavior_type(const std::string& bt);
+            const std::string& behavior_type() const { return behavior_type_; }
+            const std::string& urdf() const { return urdf_; }
+            const std::string& floating_base_joint_name() const { return floating_base_joint_name_; }
+
+            //check if pinocchio model is colliding
+            inria_wbc::utils::CollisionCheck collision_check() { return collision_check_; }
+            bool is_model_colliding() { return is_model_colliding_; }
+            void set_send_cmd(const bool send_cmd) { send_cmd_ = send_cmd; };
+
+            Eigen::VectorXd q_solver(bool filter_mimics = true) const;
+            const void qp_step_back(const Eigen::VectorXd& q, const Eigen::VectorXd& dq, const pinocchio::Data& data);
+            const void qp_step_back() { qp_step_back(q_tsid_prev_, v_tsid_prev_, *data_prev_); };
 
         private:
             std::vector<int> get_non_mimics_indexes() const;
@@ -172,12 +179,13 @@ namespace inria_wbc {
             void _solve(const Eigen::VectorXd& q, const Eigen::VectorXd& dq);
             void _solve() { _solve(q_tsid_, v_tsid_); }
 
-            const YAML::Node& config_;
             bool verbose_ = false;
             double t_;
             double dt_;
             bool floating_base_;
             std::string base_path_;
+            std::string urdf_;
+            std::string floating_base_joint_name_;
 
             // true if we close the loop with actuator position/vel
             // and floating base position
@@ -200,6 +208,10 @@ namespace inria_wbc {
             tsid::math::Vector momentum_; // momentum
             std::unordered_map<std::string, tsid::math::Vector> activated_contacts_forces_; //tsid contact forces of the activated contacts
 
+            tsid::math::Vector q_tsid_prev_; // latest sent tsid joint positions 
+            tsid::math::Vector v_tsid_prev_; // latest sent tsid joint positions 
+            std::shared_ptr<pinocchio::Data> data_prev_; // latest sent  pinocchio data 
+
             //---- Dart conventions for the floating base: axis-angle
             Eigen::VectorXd q0_; // tsid joint positions resized for dart
             Eigen::VectorXd q_; // tsid joint positions resized for dart
@@ -210,24 +222,15 @@ namespace inria_wbc {
             std::shared_ptr<tsid::robots::RobotWrapper> robot_;
             std::shared_ptr<tsid::InverseDynamicsFormulationAccForce> tsid_;
             std::shared_ptr<tsid::solvers::SolverHQPBase> solver_;
+
+            inria_wbc::utils::CollisionCheck collision_check_;
+            bool check_model_collisions_;
+            bool is_model_colliding_ = false;
+            bool send_cmd_ = true;
+            Eigen::VectorXd q_solver_; //q computed by the qp solver even when not sent (with send_cmd_ == false)
+
+            std::string solver_to_use_;
         };
-
-        inline tsid::trajectories::TrajectorySample to_sample(const Eigen::VectorXd& ref)
-        {
-            tsid::trajectories::TrajectorySample sample;
-            sample.pos = ref;
-            sample.vel.setZero(ref.size());
-            sample.acc.setZero(ref.size());
-            return sample;
-        }
-
-        inline tsid::trajectories::TrajectorySample to_sample(const pinocchio::SE3& ref)
-        {
-            tsid::trajectories::TrajectorySample sample;
-            sample.resize(12, 6);
-            tsid::math::SE3ToVector(ref, sample.pos);
-            return sample;
-        }
 
         using Factory = utils::Factory<Controller, YAML::Node>;
         template <typename T>

@@ -23,11 +23,9 @@ namespace inria_wbc {
             virtual ~DamageController(){};
             Eigen::VectorXd tau(bool filter_mimics) const;
             virtual void update(const SensorData& sensor_data = {}) override;
-            // joint weight
-            void set_joint_weight_weights(const Vector& weights); 
             std::shared_ptr<tsid::contacts::Contact6dExt> contact_task(const std::string& str) { return contact(str); }
         protected:
-            virtual void parse_configuration(const YAML::Node& config);
+
         };
 
     } // namespace controllers

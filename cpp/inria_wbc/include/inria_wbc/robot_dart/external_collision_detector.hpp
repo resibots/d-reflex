@@ -18,7 +18,7 @@ namespace inria_wbc {
                 const std::map<std::string, std::string> filter_body_names_pairs = {})
                 : _robot(robot),
                   _external_robot(external_robot),
-                  _collision_detector(dart::collision::CollisionDetector::getFactory()->create("ode")),
+                  _collision_detector(dart::collision::CollisionDetector::getFactory()->create("fcl")),
                   _collision_group(_collision_detector->createCollisionGroup(robot->skeleton().get())),
                   _external_collision_group(_collision_detector->createCollisionGroup(external_robot->skeleton().get())),
                   _collision_filter(std::make_shared<dart::collision::BodyNodeCollisionFilter>()),
@@ -32,15 +32,6 @@ namespace inria_wbc {
                     IWBC_ASSERT(bd2, "ExternalCollisionDetector check filter_body_names_pairs: ", pair.second, "is not in external_robot");
                     _collision_filter->addBodyNodePairToBlackList(bd1, bd2);
                 }
-            }
-             void remove_frames()
-            {
-                _collision_group->removeAllShapeFrames();
-            }
-
-            void add_frames()
-            {
-                _collision_group->addShapeFramesOf(_robot->skeleton().get());
             }
             const std::vector<std::string>& collide()
             {

@@ -23,64 +23,14 @@
 
 #include "inria_wbc/controllers/damage_controller.hpp"
 #include "inria_wbc/controllers/tasks.hpp"
-#include "tsid/tasks/task_joint_weight.hpp"
+#include "inria_wbc/trajs/utils.hpp"
 
 using namespace tsid;
 using namespace tsid::math;
 
 namespace inria_wbc {
 
-    namespace tasks {
-
-        ////// Joint Weight Task //////
-        std::shared_ptr<tsid::tasks::TaskBase> make_joint_weight(
-            const std::shared_ptr<robots::RobotWrapper>& robot,
-            const std::shared_ptr<InverseDynamicsFormulationAccForce>& tsid,
-            const std::string& task_name, const YAML::Node& node, const YAML::Node& controller_node)
-        {
-            assert(tsid);
-            assert(robot);
-
-            // retrieve parameters from YAML
-            double kp = node["kp"].as<double>();
-            auto weight = node["weight"].as<double>();
-            std::vector<double> temp_weights = node["weights"].as<std::vector<double>>();
-            auto ref_name = IWBC_CHECK(node["ref"].as<std::string>());
-
-            IWBC_ASSERT(robot->model().referenceConfigurations.count(ref_name) == 1, "Reference name ", ref_name, " not found");
-            auto ref_q = robot->model().referenceConfigurations[ref_name];
-
-            Vector weights(robot->na());
-            assert(temp_weights.size() == robot->na());
-            for (uint i=0; i<robot->na(); i++){
-                weights[i] = temp_weights.at(i);
-            }
-
-            // create the task
-            auto task = std::make_shared<tsid::tasks::TaskJointWeight>(task_name, *robot);
-            //auto task = std::make_shared<tsid::tasks::TaskJointPosture>(task_name, *robot);
-
-            bool floating_base_flag = (robot->na() == robot->nv()) ? false : true;
-            int n_actuated = floating_base_flag ? robot->nv() - 6 : robot->nv();
-
-            task->Kp(kp * Vector::Ones(n_actuated));
-            task->Kd(2.0 * task->Kp().cwiseSqrt());
-
-            // set the reference to the current position of the robot
-            task->setReference(to_sample(ref_q.tail(robot->na())));
-            
-            task->set_weights(weights); 
-            /*
-            task->Kp(kp);
-            task->Kd(2 * sqrt(kp));
-            */
-            // add the task to TSID (side effect, be careful)
-            tsid->addMotionTask(*task, weight, 1);
-
-            return task;
-        }
-        RegisterYAML<tsid::tasks::TaskJointWeight> __register_joint_weight("joint-weight", make_joint_weight);
-
+   namespace tasks {
         ////// Contacts //////
         /// this looks like a task, but this does not derive from tsid::task::TaskBase
         std::shared_ptr<tsid::contacts::Contact6dExt> make_contact_task(
@@ -168,7 +118,7 @@ namespace inria_wbc {
 
         DamageController::DamageController(const YAML::Node& config) : TalosPosTracker(config)
         {
-            parse_configuration(config["CONTROLLER"]);
+   //         parse_configuration(config["CONTROLLER"]);
             if (verbose_)
                 std::cout << "Talos Damage Controller initialized" << std::endl;
         }
@@ -178,14 +128,10 @@ namespace inria_wbc {
             return filter_mimics ? utils::slice_vec(tau_, non_mimic_indexes_) : tau_;
         }
         
-        void DamageController::parse_configuration(const YAML::Node& config)
-        {
-            TalosPosTracker::parse_configuration(config);
-        }
-
-        void DamageController::set_joint_weight_weights(const Vector& weights){
-            std::static_pointer_cast<tsid::tasks::TaskJointWeight>(tasks_["joint_weight"])->set_weights(weights);
-        }
+    //    void DamageController::parse_configuration(const YAML::Node& config)
+    //    {
+    //        TalosPosTracker::parse_configuration(config);
+     //   }
 
         void DamageController::update(const SensorData& sensor_data)
         {

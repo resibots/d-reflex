@@ -7,23 +7,19 @@
 namespace inria_wbc {
     namespace robot_dart {
         // compute torques from positions
-        inline Eigen::VectorXd compute_spd(const std::shared_ptr<::robot_dart::Robot>& robot, const Eigen::VectorXd& targetpos, double dt, const std::vector<std::string>& joints, bool floating_base = true, float arm_stiffness = 10000)
+        inline Eigen::VectorXd compute_spd(const std::shared_ptr<::robot_dart::Robot>& robot, const Eigen::VectorXd& targetpos, double dt, const std::vector<std::string>& joints, bool floating_base = true)
         {
             Eigen::VectorXd q = robot->positions(joints);
             Eigen::VectorXd dq = robot->velocities(joints);
-            float stiffness = 10000;
-            float damping = 100;
+
+            float stiffness = 10000 / (dt * 1000); //tuned for 1000hz and then scaled for other freq
+            float damping = 100 / (dt * 1000);
             int ndofs = joints.size();
             Eigen::MatrixXd Kp = Eigen::MatrixXd::Identity(ndofs, ndofs);
             Eigen::MatrixXd Kd = Eigen::MatrixXd::Identity(ndofs, ndofs);
-            
+
             for (std::size_t i = 0; i < ndofs; ++i) {
-                if (joints.at(i).substr(0,9) == "arm_right") {
-                    Kp(i, i) = arm_stiffness;
-                }
-                else {
-                    Kp(i, i) = stiffness;
-                } 
+                Kp(i, i) = stiffness;
                 Kd(i, i) = damping;
             }
 

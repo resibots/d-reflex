@@ -64,7 +64,7 @@ namespace inria_wbc {
 
         void Hands::activate_reflex(){
             use_reflex_ = true; 
-            
+            /*
             auto rh_init = controller_->model_frame_pos("gripper_right_base_link");
             auto rh_final = rh_init;
 
@@ -82,32 +82,27 @@ namespace inria_wbc {
             rh_final.rotation() = q2.toRotationMatrix();
 
             reflex_trajectory_ = trajectory_handler::compute_traj(rh_init, rh_final, controller_->dt(), reflex_duration);
+            */
         }
 
         void Hands::update(const controllers::SensorData& sensor_data)
         {
             
-            if (use_reflex_){
-                auto rh_ref = reflex_trajectory_[reflex_time_];
-                std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller_)->set_se3_ref(rh_ref, "rh");
-                controller_->update(sensor_data);
-                if (reflex_time_+1 < reflex_trajectory_.size()){
-                    reflex_time_++;
-                }
-            } else {
+            if (!use_reflex_){
                 auto rh_ref = rh_current_trajectory_[time_];
                 auto lh_ref = lh_current_trajectory_[time_];
                 std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller_)->set_se3_ref(lh_ref, "lh");
                 std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller_)->set_se3_ref(rh_ref, "rh");
+            }
 
-                controller_->update(sensor_data);
-                time_++;
-                if (time_ == lh_current_trajectory_.size()) {
-                    time_ = 0;
-                    traj_selector_ = ++traj_selector_ % lh_trajectories_.size();
-                    lh_current_trajectory_ = lh_trajectories_[traj_selector_];
-                    rh_current_trajectory_ = rh_trajectories_[traj_selector_];
-                }
+            controller_->update(sensor_data);
+            time_++;
+            if (time_ == lh_current_trajectory_.size()) {
+                time_ = 0;
+                traj_selector_ = ++traj_selector_ % lh_trajectories_.size();
+                lh_current_trajectory_ = lh_trajectories_[traj_selector_];
+                rh_current_trajectory_ = rh_trajectories_[traj_selector_];
+
             }
         }
 

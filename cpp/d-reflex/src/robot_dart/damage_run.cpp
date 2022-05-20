@@ -45,7 +45,7 @@ static const std::string red = "\x1B[31m";
 static const std::string rst = "\x1B[0m";
 static const std::string bold = "\x1B[1m";
 
-enum State {Failure, Success, Fallen};
+enum State {Failure, Falling, Running, Fallen_floor, Fallen_wall, Unfallen, Recovered, Timeout};
 
 // header 
 void write_timestate(State state, std::string xp_folder, double time);
@@ -137,39 +137,6 @@ std::string create_xp_folder(){
     return data_path;
 }
 
-inline Eigen::VectorXd compute_spd(const std::shared_ptr<::robot_dart::Robot>& robot, const Eigen::VectorXd& targetpos, double dt, const std::vector<std::string>& joints, bool floating_base = true, float arm_stiffness = 10000)
-{
-    Eigen::VectorXd q = robot->positions(joints);
-    Eigen::VectorXd dq = robot->velocities(joints);
-    float stiffness = 10000;
-    float damping = 100;
-    int ndofs = joints.size();
-    Eigen::MatrixXd Kp = Eigen::MatrixXd::Identity(ndofs, ndofs);
-    Eigen::MatrixXd Kd = Eigen::MatrixXd::Identity(ndofs, ndofs);
-    
-    for (std::size_t i = 0; i < ndofs; ++i) {
-        if (joints.at(i).substr(0,9) == "arm_right") {
-            Kp(i, i) = arm_stiffness;
-        } else {
-            Kp(i, i) = stiffness;
-        } 
-        Kd(i, i) = damping;
-    }
-
-    if (robot->free() && floating_base) // floating base
-        for (std::size_t i = 0; i < 6; ++i) {
-            Kp(i, i) = 0;
-            Kd(i, i) = 0;
-        }
-
-    Eigen::MatrixXd invM = (robot->mass_matrix(joints) + Kd * dt).inverse();
-    Eigen::VectorXd p = -Kp * (q + dq * dt - targetpos);
-    Eigen::VectorXd d = -Kd * dq;
-    Eigen::VectorXd qddot = invM * (-robot->coriolis_gravity_forces(joints) + p + d + robot->constraint_forces(joints));
-    Eigen::VectorXd commands = p + d - Kd * qddot * dt;
-    return commands;
-}
-
 int main(int argc, char* argv[])
 {
     try {
@@ -246,11 +213,42 @@ int main(int argc, char* argv[])
         for (auto& x : vm["log"].as<std::vector<std::string>>())
             log_files[x] = std::make_shared<std::ofstream>((x + ".dat").c_str());
 
-        //////////////////// INIT DART ROBOT //////////////////////////////////////
+        //////////////////// Load Controller path //////////////////////////////////////
         ///// CONTROLLER
         auto controller_path = vm["controller"].as<std::string>();
         auto controller_config = IWBC_CHECK(YAML::LoadFile(controller_path));
 
+        //////////////////// Load parameters //////////////////////////////////////
+        // duration
+        double duration = IWBC_CHECK(controller_config["CONTROLLER"]["duration"].as<double>());
+        // fall early stopping
+        bool use_falling_early_stopping = IWBC_CHECK(controller_config["CONTROLLER"]["use_falling_early_stopping"].as<bool>());
+        double fallen_treshold = IWBC_CHECK(controller_config["CONTROLLER"]["fallen_treshold"].as<double>());
+        // damages
+        double damage_time = IWBC_CHECK(controller_config["CONTROLLER"]["damage_time"].as<double>());
+        auto locked = IWBC_CHECK(controller_config["CONTROLLER"]["locked"].as<std::vector<std::string>>());
+        auto passive = IWBC_CHECK(controller_config["CONTROLLER"]["passive"].as<std::vector<std::string>>());
+        auto amputated = IWBC_CHECK(controller_config["CONTROLLER"]["amputated"].as<std::vector<std::string>>());
+        bool hole = IWBC_CHECK(controller_config["CONTROLLER"]["hole"].as<bool>());
+        auto hole_params = IWBC_CHECK(controller_config["CONTROLLER"]["hole_params"].as<std::vector<double>>());
+        bool use_damage = locked.size()>0 || passive.size()>0 || amputated.size()>0 || hole;    
+        // reflex
+        auto reflex_time = IWBC_CHECK(controller_config["CONTROLLER"]["reflex_time"].as<double>());
+        auto use_baseline = IWBC_CHECK(controller_config["CONTROLLER"]["use_baseline"].as<bool>());
+        auto remove_rf_tasks = IWBC_CHECK(controller_config["CONTROLLER"]["remove_rf_tasks"].as<bool>());
+        auto use_reflex_trajectory = IWBC_CHECK(controller_config["CONTROLLER"]["use_reflex_trajectory"].as<bool>());
+        auto update_contact_when_detected = IWBC_CHECK(controller_config["CONTROLLER"]["update_contact_when_detected"].as<bool>());
+        auto use_left_hand = IWBC_CHECK(controller_config["CONTROLLER"]["use_left_hand"].as<bool>());
+        auto use_right_hand = IWBC_CHECK(controller_config["CONTROLLER"]["use_right_hand"].as<bool>());
+
+        // logging
+        auto log_level = IWBC_CHECK(controller_config["CONTROLLER"]["log_level"].as<int>());
+
+        // vizual 
+        auto wall_color = IWBC_CHECK(controller_config["CONTROLLER"]["wall_opacity"].as<std::vector<double>>());
+        auto collision_env_urdf = IWBC_CHECK(controller_config["CONTROLLER"]["collision_env_urdf"].as<std::string>());
+        auto visual_env_urdf = IWBC_CHECK(controller_config["CONTROLLER"]["visual_env_urdf"].as<std::string>());
+        //////////////////// INIT DART ROBOT //////////////////////////////////////
         std::srand(std::time(NULL));
         std::vector<std::pair<std::string, std::string>> packages = {{"talos_description", "talos/talos_description"}};
         std::string urdf = vm.count("fast") ? "talos/talos_fast.urdf" : "talos/" + IWBC_CHECK(controller_config["CONTROLLER"]["urdf"].as<std::string>()); 
@@ -305,9 +303,80 @@ int main(int argc, char* argv[])
     simu->enable_status_bar(false);
     
 #endif
-        //robot->set_cast_shadows(false);
         simu->add_robot(robot);
-        auto floor = simu->add_checkerboard_floor();
+        /*
+        auto collision_env = std::make_shared<robot_dart::Robot>(collision_env_urdf);
+        collision_env->fix_to_world();
+        simu->add_robot(collision_env);
+        auto visual_env = std::make_shared<robot_dart::Robot>(visual_env_urdf);
+        simu->add_visual_robot(visual_env);
+        */
+
+        std::shared_ptr<robot_dart::Robot> floor;
+        // create a floor 
+        double x = hole_params.at(0);
+        double y = hole_params.at(1);
+        double wx = hole_params.at(2);
+        double wy = hole_params.at(3);
+        if (hole){
+            double mass = 100.;
+            const std::string type = "not free"; 
+            Eigen::Vector6d pose = Eigen::Vector6d::Zero(6);
+            pose(5) = -0.05;
+            // right part 
+            Eigen::Vector3d dims = {10, 5, 0.1};
+            pose(4) = -2.5+y-wy;
+            Eigen::Vector4d color= {173/255., 216/255., 230/255., 0};
+            auto right_floor = robot_dart::Robot::create_box(dims, pose, type, mass, color, "floor_right");
+            simu->add_robot(right_floor);
+            // left 
+            pose(4) = 2.5+y+wy;
+            auto left_floor = robot_dart::Robot::create_box(dims, pose, type, mass, color, "floor_left");
+            simu->add_robot(left_floor);
+            // center part 
+            dims(1) = 2 * wy;
+            dims(0) = 2 * wx;
+            pose(3) = x;
+            pose(4) = y;
+            Eigen::Vector4d red_color= {0.8, 0., 0., 1};
+            floor = robot_dart::Robot::create_box(dims, pose, type, mass, red_color, "floor_damageable");
+            simu->add_robot(floor);
+            // rear part 
+            dims(0) = abs(-5-(x-wx));
+            pose(3) = x-wx-dims(0)/2;
+            auto rear_floor = robot_dart::Robot::create_box(dims, pose, type, mass, color, "floor_rear");
+            simu->add_robot(rear_floor);
+            // front part
+            dims(0) = abs(5-(x+wx));
+            pose(3) = x+wx+dims(0)/2;
+            auto front_floor = robot_dart::Robot::create_box(dims, pose, type, mass, color, "floor_front");
+            simu->add_robot(front_floor);
+
+            auto white = dart::Color::White(1.);
+            auto gray = dart::Color::Gray(1.);
+            Eigen::Vector3d square_dims = {1, 1, 0.1};
+            Eigen::Vector6d square_pose = Eigen::Vector6d::Zero(6);
+            square_pose(5) = -0.051;
+            for (int i=0; i<10; i++){
+                for (int j=0; j<10; j++){
+                    square_pose(3) = -4.5 + i ;
+                    square_pose(4) = -4.5 + j ;
+                    Eigen::Vector4d square_color;
+                    if ((i+j)%2 == 0){
+                        std::cout << i+j << " gray" << std::endl;
+                        square_color = gray;
+                    } else {
+                        square_color = white;
+                    }
+
+                    auto square = robot_dart::Robot::create_box(square_dims, square_pose, type, mass, square_color, "floor_square");
+                    simu->add_visual_robot(square);
+                }
+            }            
+        } else {
+            floor = simu->add_checkerboard_floor();
+        }
+        
         
         // do some modifications according to command-line options
         controller_config["CONTROLLER"]["urdf"] = robot->model_filename();
@@ -347,37 +416,12 @@ int main(int argc, char* argv[])
         // add sensors to the robot
         auto ft_sensor_left = simu->add_sensor<robot_dart::sensor::ForceTorque>(robot, "leg_left_6_joint", control_freq);
         // tim
-        //auto ft_sensor_right = simu->add_sensor<robot_dart::sensor::ForceTorque>(robot, "leg_right_6_joint", control_freq);
+        auto ft_sensor_right = simu->add_sensor<robot_dart::sensor::ForceTorque>(robot, "leg_right_6_joint", control_freq);
         robot_dart::sensor::IMUConfig imu_config;
         imu_config.body = robot->body_node("imu_link"); // choose which body the sensor is attached to
         imu_config.frequency = control_freq; // update rate of the sensor
         auto imu = simu->add_sensor<robot_dart::sensor::IMU>(imu_config);
 
-        //////////////////// Load parameters //////////////////////////////////////
-        // duration
-        double duration = IWBC_CHECK(controller_config["CONTROLLER"]["duration"].as<double>());
-        // fall early stopping
-        bool use_falling_early_stopping = IWBC_CHECK(controller_config["CONTROLLER"]["use_falling_early_stopping"].as<bool>());
-        double fallen_treshold = IWBC_CHECK(controller_config["CONTROLLER"]["fallen_treshold"].as<double>());
-        // damages
-        double damage_time = IWBC_CHECK(controller_config["CONTROLLER"]["damage_time"].as<double>());
-        auto locked = IWBC_CHECK(controller_config["CONTROLLER"]["locked"].as<std::vector<std::string>>());
-        auto passive = IWBC_CHECK(controller_config["CONTROLLER"]["passive"].as<std::vector<std::string>>());
-        auto amputated = IWBC_CHECK(controller_config["CONTROLLER"]["amputated"].as<std::vector<std::string>>());
-        bool use_damage = locked.size()>0 || passive.size()>0 || amputated.size()>0;
-        // reflex
-        auto reflex_time = IWBC_CHECK(controller_config["CONTROLLER"]["reflex_time"].as<double>());
-        auto use_baseline = IWBC_CHECK(controller_config["CONTROLLER"]["use_baseline"].as<bool>());
-        auto use_reflex_trajectory = IWBC_CHECK(controller_config["CONTROLLER"]["use_reflex_trajectory"].as<bool>());
-        auto update_contact_when_detected = IWBC_CHECK(controller_config["CONTROLLER"]["update_contact_when_detected"].as<bool>());
-        auto reflex_arm_stiffness = IWBC_CHECK(controller_config["CONTROLLER"]["reflex_arm_stiffness"].as<float>());
-        auto reflex_stiffness_alpha = IWBC_CHECK(controller_config["CONTROLLER"]["reflex_stiffness_alpha"].as<float>());
-
-        // logging
-        auto log_level = IWBC_CHECK(controller_config["CONTROLLER"]["log_level"].as<int>());
-
-        // vizual 
-        auto wall_color = IWBC_CHECK(controller_config["CONTROLLER"]["wall_opacity"].as<std::vector<double>>());
         //////////////////// START SIMULATION //////////////////////////////////////
         std::cout << "dt:" << dt << " control freq:" << control_freq <<std::endl;
         simu->set_control_freq(control_freq); // default = 1000 Hz
@@ -392,8 +436,9 @@ int main(int argc, char* argv[])
 
         // Add collision shapes
         double wall_distance = 0.;
-        double wall_angle = 0.;
+        //double wall_angle = 0.;
         auto colision_shapes = controller_config["CONTROLLER"]["colision_shapes"].as<std::vector<std::pair<bool,std::vector<double>>>>();
+        auto friction_coeff = controller_config["CONTROLLER"]["friction"].as<double>(); 
         std::vector<std::shared_ptr<robot_dart::Robot>> colision_shapes_robots; 
         for (auto colision_shape: colision_shapes ){
             assert(colision_shape.second.size() == 9);
@@ -404,7 +449,7 @@ int main(int argc, char* argv[])
                 pose(i-3) = colision_shape.second.at(i);
             } 
             wall_distance = pose[4];
-            wall_angle = pose[2];
+            //wall_angle = pose[2];
             const std::string type = "not free"; 
             double mass = 1.;
             const Eigen::Vector4d color= {wall_color[0], wall_color[1], wall_color[2], wall_color[3]};
@@ -420,7 +465,10 @@ int main(int argc, char* argv[])
             }
             simu->add_robot(shape);
             colision_shapes_robots.push_back(shape);
+            shape->set_friction_coeffs(friction_coeff);
         }
+        //robot->set_restitution_coeffs(10000.);
+        // display contact pos 
         if (false){
             auto base_path = IWBC_CHECK(controller_config["CONTROLLER"]["base_path"].as<std::string>());
             auto tasks_file = IWBC_CHECK(controller_config["CONTROLLER"]["tasks"].as<std::string>());
@@ -436,6 +484,10 @@ int main(int argc, char* argv[])
             std::shared_ptr<robot_dart::Robot> shape =  robot_dart::Robot::create_ellipsoid(dims, pose, type, mass, color, "sphere");
             simu->add_visual_robot(shape);
         }
+
+        // add body axes visualization
+        //robot->set_draw_axis("base_link", 2.);
+        //robot->set_draw_axis("imu_link", 3.);
 
         // add CoM visualization 
         double mass = 1.;
@@ -457,6 +509,7 @@ int main(int argc, char* argv[])
         if(vm.count("ghost")){
             //simu->add_visual_robot(contact_vizu);
             robot->set_draw_axis("gripper_right_base_link", 1.);
+            robot->set_draw_axis("gripper_left_base_link", 1.);
         }
         
         // self-collision shapes
@@ -503,14 +556,16 @@ int main(int argc, char* argv[])
         inria_wbc::robot_dart::RobotDamages robot_damages(robot, simu, active_dofs_controllable, active_dofs);
         std::vector<double> imuz;
         std::vector<double> filtered_imuz;
-        State state = State::Failure; 
+        State state = State::Running; 
         bool has_collide_with_the_wall = false; 
-        bool first_contact = true;
+        bool first_contact = true;  // for update contact after reflex 
+        bool has_touched_the_wall = false;
         Eigen::VectorXd activated_joints = Eigen::VectorXd::Zero(active_dofs.size());
-        float arm_stiffness = 10000;
         bool in_contact = false;
 
-        while (simu->scheduler().current_time() < duration && !simu->graphics()->done() && (state != State::Fallen)) {
+       
+
+        while (simu->scheduler().current_time() < duration && !simu->graphics()->done() && (state == State::Running)) {
             // check all collisions 
             bool still_in_contact = false;
             auto col = simu->world()->getConstraintSolver()->getLastCollisionResult();
@@ -530,6 +585,7 @@ int main(int argc, char* argv[])
                 bool has_wall_contact = false; 
                 std::string floor_contact = "";
                 std::string wall_contact = "";
+                // checkerboard_floor
                 if (name1 == "BodyNode"){
                     has_floor_contact = true;
                     floor_contact = name2;
@@ -538,6 +594,16 @@ int main(int argc, char* argv[])
                     has_floor_contact = true;
                     floor_contact = name1;
                 } 
+                // dameageable floor 
+                if (name1.substr(0,5) == "floor" && name2.substr(0,5) != "floor"){
+                    has_floor_contact = true;
+                    floor_contact = name2;
+                }
+                if (name2.substr(0,5) == "floor" && name1.substr(0,5) != "floor"){
+                    has_floor_contact = true;
+                    floor_contact = name1;
+                }
+                // wall 
                 if (name1 == "collision_shape"){
                     has_wall_contact = true;
                     wall_contact = name2;
@@ -547,65 +613,62 @@ int main(int argc, char* argv[])
                     wall_contact = name1;
                 } 
 
-                //contact with the floor 
-                if (has_floor_contact && floor_contact != "leg_left_6_link" && floor_contact != "leg_right_6_link"){
-                    state = State::Fallen;
+                // contact with the floor 
+                if (use_falling_early_stopping && has_floor_contact && floor_contact != "leg_left_6_link" && floor_contact != "leg_right_6_link"){
+                    state = State::Fallen_floor;
                     std::cout << "Fallen at " << simu->scheduler().current_time() << " for touching the floor with " << floor_contact << std::endl;
                     write_timestate(state, xp_folder, simu->scheduler().current_time());
-                    break;
+                    return 0;
                 }
 
                 // contact with the wall
                 if (has_wall_contact) {
+                    has_touched_the_wall = true;
+                    // good contact (hand or right arm)
+                    bool right = (wall_contact == "gripper_right_base_link") || (wall_contact.substr(0,9) == "arm_right");
+                    bool left = (wall_contact == "gripper_left_base_link") || (wall_contact.substr(0,8) == "arm_left");
+                    std::string hand = right ? "gripper_right_base_link_joint" : "gripper_left_base_link_joint"; 
+                    std::string contact_hand = right ? "contact_rhand" : "contact_lhand"; 
                     // shutdown if initial wall prenetration (sampling rejection)
-                    if (simu->scheduler().current_time() < damage_time){
-                        std::cout << "pre-damage wall contact" << std::endl;
+                    if (use_falling_early_stopping && simu->scheduler().current_time() < damage_time){
+                        auto contact_pos = controller->robot()->framePosition(controller->tsid()->data(), controller->robot()->model().getFrameId(hand));
+                        std::cout << "pre-damage wall contact at " << contact_pos.translation().transpose() << std::endl;
                         state = State::Failure;
                         write_timestate(state, xp_folder, simu->scheduler().current_time());
                         return 0; 
                     }
-                    // good contact (handball or right arm)
-                    if ((wall_contact == "gripper_right_base_link") || (wall_contact.substr(0,9) == "arm_right")){
+                    if (right || left){
                         // if conserve contact 
                         if (in_contact){
                             still_in_contact = true;
-                            arm_stiffness = reflex_stiffness_alpha * arm_stiffness + (1-reflex_stiffness_alpha ) * 10000.; 
                         } // else (if new contact)
                         else {
                             std::cout << "Made contact at " << simu->scheduler().current_time() << " the wall with " << wall_contact << std::endl;
                             static std::ofstream ofs_contact_pos(xp_folder +"/contact_pos.dat");
-                            auto contact_pos = controller->robot()->framePosition(controller->tsid()->data(), controller->robot()->model().getFrameId("gripper_right_base_link_joint"));
-                            ofs_contact_pos << simu->scheduler().current_time() << " " << contact_pos.translation().transpose() <<  std::endl; 
+                            auto contact_pos = controller->robot()->framePosition(controller->tsid()->data(), controller->robot()->model().getFrameId(hand));
+                            std::string body_in_contact = "";
+                            if ((wall_contact == "gripper_right_base_link") || (wall_contact == "gripper_left_base_link"))
+                                body_in_contact = "0";
+                            else {
+                                body_in_contact = right ? wall_contact.substr(10,1) : wall_contact.substr(9,1);
+                            }
+                            ofs_contact_pos << simu->scheduler().current_time() << " " << contact_pos.translation().transpose() << " " << body_in_contact << std::endl; 
                             in_contact = true;
                         } 
                         // if first contact on the wall 
                         if (!has_collide_with_the_wall){
-                            auto contact_pos = controller->robot()->framePosition(controller->tsid()->data(), controller->robot()->model().getFrameId("gripper_right_base_link_joint"));
+                            auto contact_pos = controller->robot()->framePosition(controller->tsid()->data(), controller->robot()->model().getFrameId(hand));
                             has_collide_with_the_wall = true; 
                             if (first_contact && update_contact_when_detected){
                                 first_contact = false;
                                 // update contact
                                 std::cout << "update contact to " << contact_pos.translation().transpose() << std::endl; 
-                                auto contact_task = std::static_pointer_cast<inria_wbc::controllers::DamageController>(controller)->contact_task("contact_rhand");
+                                auto contact_task = std::static_pointer_cast<inria_wbc::controllers::DamageController>(controller)->contact_task(contact_hand);
                                 tsid::contacts::Contact6d::SE3 contact_ref;
                                 contact_ref.translation() = contact_pos.translation();
                                 contact_ref.rotation() = contact_pos.rotation();
                                 contact_task->Contact6d::setReference(contact_ref);
-
-                                // update com
                                 /*
-                                auto lf_ref = controller->model_frame_pos("leg_left_6_joint");
-                                auto contact_task = std::static_pointer_cast<inria_wbc::controllers::DamageController>(controller)->contact_task("contact_rhand");
-                                auto contact_motion_task = contact_task->getMotionTask();
-                                auto contact_ref = contact_motion_task.getReference();
-                                auto ref = (lf_ref.translation() + contact_ref.pos.head(3))/2;
-                                std::cout << "new CoM ref: " <<  lf_ref.translation().transpose() << std::endl; 
-                                std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->set_com_ref(lf_ref.translation());
-                                */
-
-                                // update compliance 
-                                arm_stiffness = reflex_arm_stiffness; 
-
                                 if (use_reflex_trajectory){
                                     std::static_pointer_cast<inria_wbc::controllers::TalosPosTracker>(controller)->add_contact("contact_rhand");
                                     //remove right hand task
@@ -613,23 +676,22 @@ int main(int argc, char* argv[])
                                     auto rh_task = std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->se3_task("rh"); 
                                     rh_task->Kp(zero); 
                                     rh_task->Kd(zero);   
-                                }
+                                }*/
                             }
                         }
                     } // bad contact 
                     else if(use_falling_early_stopping) {  
-                        state = State::Fallen;
+                        state = State::Fallen_wall;
                         std::cout << "Fallen at " << simu->scheduler().current_time() << " for touching the wall with " << wall_contact << std::endl;
                         write_timestate(state, xp_folder, simu->scheduler().current_time());
                         has_collide_with_the_wall = true;
-                        break;
+                        return 0;
                     }
                 }
             }
             // after all contacts are treated we check if we still get a good contact on the wall
             if (in_contact && !still_in_contact){
                 in_contact = false;
-                //arm_stiffness = 10000.;
                 std::cout << "Loose contact with the wall at " << simu->scheduler().current_time() << std::endl;
                 static std::ofstream ofs_loose_contact(xp_folder +"/lose_contact.dat");
                 ofs_loose_contact << simu->scheduler().current_time() <<  std::endl; 
@@ -639,6 +701,10 @@ int main(int argc, char* argv[])
                 try {
                     if (simu->scheduler().current_time() >= damage_time && simu->scheduler().current_time() < damage_time + dt) {
                         std::cout << "Apply damage." << std::endl; 
+                        if (hole){
+                            simu->remove_robot(floor);
+                        }
+                        
                         for (auto const link: amputated){
                             robot_damages.cut(link);
                         }
@@ -688,11 +754,11 @@ int main(int argc, char* argv[])
                     sensor_data["lf_force"] = Eigen::VectorXd::Constant(3, 1e-8);
                 }
                 // right foot
-                /*if ft_sensor_right->active()) {
+                if (ft_sensor_right->active()) {
                     sensor_data["rf_torque"] = ft_sensor_right->torque();
                     sensor_data["rf_force"] = ft_sensor_right->force();
                 }
-                else */
+                else 
                 {
                     sensor_data["rf_torque"] = Eigen::VectorXd::Constant(6, 1e-8);
                     sensor_data["rf_force"] = Eigen::VectorXd::Constant(3, 1e-8);
@@ -730,12 +796,10 @@ int main(int argc, char* argv[])
                 if (vm["actuators"].as<std::string>() == "velocity" || vm["actuators"].as<std::string>() == "servo")
                     cmd = inria_wbc::robot_dart::compute_velocities(robot, q_damaged, 1. / control_freq, active_dofs_controllable);
                 else if (vm["actuators"].as<std::string>() == "spd") {
-                    //cmd = inria_wbc::robot_dart::compute_spd(robot, q_damaged, 1. / control_freq, active_dofs_controllable, false);
-                    cmd = compute_spd(robot, q_damaged, 1. / control_freq, active_dofs_controllable, false, arm_stiffness);
+                    cmd = inria_wbc::robot_dart::compute_spd(robot, q_damaged, 1. / control_freq, active_dofs_controllable, false);
                 }
                 else // torque
                     cmd = controller->tau(false);
-                
                 timer.end("cmd");
 
                 if (ghost) {
@@ -789,23 +853,21 @@ int main(int argc, char* argv[])
                 timer.end("sim");
             }
 
-
-
             // log 
             if (log_level > 0){ 
-                //static std::ofstream ofs_com(xp_folder +"/com_vel.dat");
-                //ofs_com << robot->com_velocity().transpose() << std::endl;
-                static std::ofstream ofs_lf_force(xp_folder +"/lf_force.dat");
-                ofs_lf_force << (ft_sensor_left->force()).transpose() << std::endl;
-                    
-                static std::ofstream ofs_tau(xp_folder +"/tau.dat");
-                ofs_tau << tq_sensors.transpose() << std::endl;
+                /*
+                static std::ofstream ofs_real_lf_wrench(xp_folder +"/real_lf_wrench.dat");
+                ofs_real_lf_wrench << (ft_sensor_left->wrench()).transpose() << std::endl;
+                
+                static std::ofstream ofs_real_rf_wrench(xp_folder +"/real_rf_wrench.dat");
+                ofs_real_rf_wrench << (ft_sensor_right->wrench()).transpose() << std::endl;
 
-                static std::ofstream ofs_rh_trajectory(xp_folder +"/rh_traj.dat");
-                ofs_rh_trajectory << robot->body_pose("gripper_right_base_link").translation().transpose()  << std::endl;
+                static std::ofstream ofs_tsid_lf_wrench(xp_folder +"/tsid_lf_wrench.dat");
+                ofs_tsid_lf_wrench << std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->force_torque_from_solution("left").transpose() << std::endl;
 
-                static std::ofstream ofs_rh_velocity(xp_folder +"/rh_vel.dat");
-                ofs_rh_velocity << robot->body_velocity("gripper_right_base_link").transpose()  << std::endl;
+                static std::ofstream ofs_tsid_rf_wrench(xp_folder +"/tsid_rf_wrench.dat");
+                ofs_tsid_rf_wrench << std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->force_torque_from_solution("right").transpose() << std::endl;
+                */
             }
 
             //update com visualization position 
@@ -823,21 +885,25 @@ int main(int argc, char* argv[])
             }
 
             // Stop if fallen : code 2
+            
             auto head_z_diff = std::abs(controller->model_frame_pos("head_1_link").translation()(2) - robot->body_pose("head_1_link").translation()(2));
             auto base_z_diff = std::abs(inria_wbc::robot_dart::floating_base_pos(robot->positions())[2] - controller->q(false)[2]);
-            if ((state != State::Fallen) && use_falling_early_stopping && (head_z_diff > fallen_treshold || base_z_diff > fallen_treshold)){
-                state = State::Fallen;
+            if ((state != State::Falling) && use_falling_early_stopping && (head_z_diff > fallen_treshold || base_z_diff > fallen_treshold)){
+                state = State::Falling;
                 std::cout << "Fallen at " << simu->scheduler().current_time() << std::endl;
                 write_timestate(state, xp_folder, simu->scheduler().current_time());
             }
-   
             // Damage Reflex
             if (simu->scheduler().current_time() >= reflex_time && simu->scheduler().current_time() < reflex_time + dt) {
+                std::static_pointer_cast<inria_wbc::behaviors::Hands>(behavior)->activate_reflex();
                 std::cout << simu->scheduler().current_time() << " reflex" << std::endl; 
                 // log
                 if (log_level > 0){
                     static std::ofstream ofs_tsid_q(xp_folder +"/tsid_q.dat");
                     ofs_tsid_q << controller->q(true).transpose() << std::endl;
+
+                    static std::ofstream ofs_tsid_dq(xp_folder +"/tsid_dq.dat");
+                    ofs_tsid_dq << controller->dq(true).transpose() << std::endl;
 
                     static std::ofstream ofs_real_q(xp_folder +"/real_q.dat");
                     ofs_real_q << robot->positions() << std::endl;
@@ -847,21 +913,20 @@ int main(int argc, char* argv[])
                         ofs_dof_names << name << std::endl;
                     }   
                     
-
                     static std::ofstream ofs_lh(xp_folder +"/lh.dat");
-                    ofs_lh << controller->model_frame_pos("gripper_left_joint").translation().transpose() << std::endl;
+                    ofs_lh << controller->model_frame_pos("arm_left_7_joint").translation().transpose() << std::endl;
 
                     static std::ofstream ofs_rh(xp_folder +"/rh.dat");
                     ofs_rh << controller->model_frame_pos("arm_right_7_joint").translation().transpose() << std::endl;
 
-                    static std::ofstream ofs_base(xp_folder +"/base.dat");
-                    ofs_base << inria_wbc::robot_dart::floating_base_pos(robot->positions()).transpose() << std::endl;
-
                     static std::ofstream ofs_lh_real(xp_folder +"/lh_real.dat");
-                    ofs_lh_real << robot->body_pose("gripper_left_base_link").translation().transpose() << std::endl;
+                    ofs_lh_real << robot->body_pose("arm_left_7_link").translation().transpose() << std::endl;
 
                     static std::ofstream ofs_rh_real(xp_folder +"/rh_real.dat");
                     ofs_rh_real << robot->body_pose("arm_right_7_link").translation().transpose()  << std::endl;
+                    
+                    static std::ofstream ofs_base(xp_folder +"/base.dat");
+                    ofs_base << inria_wbc::robot_dart::floating_base_pos(robot->positions()).transpose() << std::endl;
 
                     static std::ofstream ofs_com(xp_folder +"/com.dat");
                     ofs_com << robot->com().transpose() << std::endl;
@@ -890,50 +955,34 @@ int main(int argc, char* argv[])
                 
                 // TODO ne faite q'une fois le cast 
                 auto zero = Eigen::VectorXd::Zero(6);
-
+                
+                /*
                 if (use_reflex_trajectory){
                     //std::static_pointer_cast<inria_wbc::behaviors::Hands>(behavior)->activate_reflex();
                     auto rh_task = std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->se3_task("rh"); 
                     //rh_task->Kp(30 * Eigen::VectorXd::Ones(6)); 
                     //rh_task->Kd(2.0 * rh_task->Kp().cwiseSqrt()); 
-                } else {
-                    std::static_pointer_cast<inria_wbc::controllers::TalosPosTracker>(controller)->add_contact("contact_rhand");
-
-                    // com
-                    /*
-                    auto lf_ref = controller->model_frame_pos("leg_left_6_joint");
-                    auto contact_task = std::static_pointer_cast<inria_wbc::controllers::DamageController>(controller)->contact_task("contact_rhand");
-                    auto contact_motion_task = contact_task->getMotionTask();
-                    auto contact_ref = contact_motion_task.getReference();
-                    auto ref = (lf_ref.translation() + contact_ref.pos.head(3))/2;
-                    std::cout << "new CoM ref: " <<  ref.transpose() << std::endl; 
-                    std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->set_com_ref(ref);
-                    */
-                    /*
-                    auto com_task = std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->com_task();
-                    com_task->Kp(Eigen::VectorXd::Zero(3)); 
-                    com_task->Kd(Eigen::VectorXd::Zero(3)); 
-                    */
-
-                    //remove right hand task
+                }*/
+                
+                if (use_right_hand){
+                    std::static_pointer_cast<inria_wbc::controllers::TalosPosTracker>(controller)->add_contact("contact_rhand", 0);
                     auto rh_task = std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->se3_task("rh"); 
                     rh_task->Kp(zero); 
-                    rh_task->Kd(zero);   
-                }
+                    rh_task->Kd(zero);  
 
-                
-                //remove left hand task
-                auto lh_task = std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->se3_task("lh"); 
-                lh_task->Kp(zero); 
-                lh_task->Kd(zero);   
-                
+                    auto lh_task = std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->se3_task("lh"); 
+                    lh_task->Kp(zero); 
+                    lh_task->Kd(zero); 
+                }
+               
                 // remove right foot tasks if we use the undamaged talos
-                if (IWBC_CHECK(controller_config["CONTROLLER"]["urdf"].as<std::string>()) == "talos.urdf"){
+                /*
+                if (remove_rf_tasks){
                     std::static_pointer_cast<inria_wbc::controllers::TalosPosTracker>(controller)->remove_contact("contact_rfoot");
                     auto rf_task = std::static_pointer_cast<inria_wbc::controllers::PosTracker>(controller)->se3_task("rf"); 
                     rf_task->Kp(zero); 
                     rf_task->Kd(zero); 
-                }
+                }*/
 
             }
             
@@ -958,13 +1007,19 @@ int main(int argc, char* argv[])
             }
             timer.report(simu->scheduler().current_time(), 100);
         }
-        if (state != State::Fallen){
+        if (state != State::Falling){
             if (simu->scheduler().current_time() >= duration){
-                std::cout << "Successs" << std::endl;
-                state = State::Success;
+                if (has_touched_the_wall){
+                    std::cout << "Successs: Recovered from the fall by using the wall" << std::endl;
+                    state = State::Recovered;
+                } else {
+                    std::cout << "Successs: Unfallen" << std::endl;
+                    state = State::Unfallen;
+                }
+
             } else {
                 std::cout << "Failure: timeout" << std::endl;
-                state = State::Failure;
+                state = State::Timeout;
             }
             write_timestate(state, xp_folder, simu->scheduler().current_time());
         }

@@ -1,10 +1,13 @@
 #ifndef IWBC_ROBORT_DART_DAMAGES_HPP_
 #define IWBC_ROBORT_DART_DAMAGES_HPP_
 
+#include <inria_wbc/exceptions.hpp>
+
 #include <robot_dart/robot.hpp>
 #include <robot_dart/robot_dart_simu.hpp>
 #include <robot_dart/sensor/sensor.hpp>
-#include <inria_wbc/exceptions.hpp>
+
+#include <dart/dynamics/BodyNode.hpp>
 
 namespace inria_wbc {
     namespace robot_dart {
@@ -39,7 +42,8 @@ namespace inria_wbc {
 
             void cut(const std::string& link_name)
             {
-                if (std::find(_robot->body_names().begin(), _robot->body_names().end(), link_name) == _robot->body_names().end())
+                auto vec = _robot->body_names();
+                if (std::find(vec.begin(), vec.end(), link_name) == vec.end())
                     IWBC_ERROR("cut ", link_name, " is not a valid robot body name");
 
                 _damaged = true;
@@ -63,7 +67,7 @@ namespace inria_wbc {
                 _damage_list.push_back(cut_damage);
             }
 
-            void motor_damage(const std::string& joint_name, const int& damage_type)
+            void motor_damage(const std::string& joint_name, int damage_type)
             {
                 if (_robot->joint_map().find(joint_name) == _robot->joint_map().end())
                     IWBC_ERROR("motor_damage ", joint_name, " not in the robot joint map");
